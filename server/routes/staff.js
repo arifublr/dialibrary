@@ -150,13 +150,17 @@ r.post('/biblio', wrap(async (req, res) => {
     publisher: str(req.body.publisher, { max: 100 }), year: req.body.year ? int(req.body.year, { min: 1000, max: 2100, name: 'Year' }) : null,
     language: str(req.body.language, { max: 40 }) || 'English',
     subjects: str(req.body.subjects, { max: 200 }).split(/[|;,]/).map((x) => x.trim()).filter(Boolean).join('|'),
+    searchAliases: str(req.body.searchAliases, { max: 1000 }).split(/[|;]/).map((x) => x.trim()).filter(Boolean).join('|'),
     callNumber: str(req.body.callNumber, { max: 40 }), description: str(req.body.description, { max: 1500 }),
   };
   const copies = int(req.body.copies, { min: 1, max: 20, def: 1, name: 'Copies' });
-  const info = await sql.prepare(`INSERT INTO biblio (title,author,isbn,publisher,year,language,subjects,call_number,description) VALUES (?,?,?,?,?,?,?,?,?)`)
-    .run(title, b.author, b.isbn, b.publisher, b.year, b.language, b.subjects, b.callNumber, b.description);
+  const info = await sql.prepare(`INSERT INTO biblio (title,author,isbn,publisher,year,language,subjects,search_aliases,call_number,description) VALUES (?,?,?,?,?,?,?,?,?,?)`)
+    .run(title, b.author, b.isbn, b.publisher, b.year, b.language, b.subjects, b.searchAliases, b.callNumber, b.description);
   const barcodes = [];
-  for (let i = 0; i < copies; i++) barcodes.push(await addItem(info.lastInsertRowid, str(req.body.location, { max: 60 }) || 'Main Shelves'));
+  for (let i = 0; i < copies; i++) {
+    barcodes.push(await addItem(info.lastInsertRowid, str(req.body.location, { max: 60 }) || 'Main Shelves', undefined,
+      str(req.body.shelfNumber, { max: 40 })));
+  }
   await A.audit(req, 'biblio.create', { id: info.lastInsertRowid, title });
   res.json({ id: info.lastInsertRowid, barcodes });
 }));
@@ -165,9 +169,9 @@ async function nextBarcode() {
   const row = await sql.prepare(`SELECT MAX(CAST(substr(barcode,2) AS INTEGER)) m FROM items WHERE barcode LIKE 'B%'`).get();
   return 'B' + String((row?.m || 0) + 1).padStart(6, '0');
 }
-async function addItem(biblioId, location, barcode) {
+async function addItem(biblioId, location, barcode, shelfNumber = '') {
   const code = barcode || (await nextBarcode());
-  await sql.prepare(`INSERT INTO items (biblio_id,barcode,location) VALUES (?,?,?)`).run(biblioId, code, location);
+  await sql.prepare(`INSERT INTO items (biblio_id,barcode,location,shelf_number) VALUES (?,?,?,?)`).run(biblioId, code, location, shelfNumber);
   return code;
 }
 r.post('/items', wrap(async (req, res) => {
@@ -175,19 +179,24 @@ r.post('/items', wrap(async (req, res) => {
   if (!(await sql.prepare('SELECT 1 FROM biblio WHERE id=?').get(biblioId))) throw new HttpError(404, 'Record not found');
   const bc = str(req.body.barcode, { max: 40 });
   if (bc && (await sql.prepare('SELECT 1 FROM items WHERE barcode=?').get(bc))) throw new HttpError(409, 'That barcode already exists');
-  const code = await addItem(biblioId, str(req.body.location, { max: 60 }) || 'Main Shelves', bc);
+  const code = await addItem(biblioId, str(req.body.location, { max: 60 }) || 'Main Shelves', bc,
+    str(req.body.shelfNumber, { max: 40 }));
   await A.audit(req, 'item.create', { barcode: code });
   res.json({ barcode: code });
 }));
 
 r.patch('/items/:barcode', wrap(async (req, res) => {
-  const status = str(req.body.status, { max: 20 });
-  if (!['available', 'lost', 'withdrawn', 'repair'].includes(status)) throw bad('Status must be available, lost, withdrawn or repair');
+  const hasStatus = 'status' in req.body;
+  const hasShelfNumber = 'shelfNumber' in req.body;
+  if (!hasStatus && !hasShelfNumber) throw bad('Nothing to update');
+  const status = hasStatus ? str(req.body.status, { max: 20 }) : null;
+  if (hasStatus && !['available', 'lost', 'withdrawn', 'repair'].includes(status)) throw bad('Status must be available, lost, withdrawn or repair');
+  const shelfNumber = hasShelfNumber ? str(req.body.shelfNumber, { max: 40 }) : null;
   const it = await sql.prepare(`SELECT i.*, b.title FROM items i JOIN biblio b ON b.id=i.biblio_id WHERE i.barcode=?`).get(req.params.barcode);
   if (!it) throw new HttpError(404, 'Item not found');
   const loan = await sql.prepare(`SELECT * FROM loans WHERE item_id=? AND returned_at IS NULL`).get(it.id);
-  if (loan && status !== 'lost') throw new HttpError(409, 'Check the item in before changing its status');
-  if (loan && status === 'lost') {
+  if (hasStatus && loan && status !== 'lost') throw new HttpError(409, 'Check the item in before changing its status');
+  if (hasStatus && loan && status === 'lost') {
     const s = settings.get();
     await sql.prepare(`UPDATE loans SET returned_at=? WHERE id=?`).run(new Date().toISOString(), loan.id);
     await nosql.fines.insertAsync({
@@ -196,10 +205,15 @@ r.patch('/items/:barcode', wrap(async (req, res) => {
       amount: s.lostCharge, status: 'unpaid', createdAt: new Date().toISOString(),
     });
   }
-  await sql.prepare(`UPDATE items SET status=? WHERE id=?`).run(status, it.id);
-  if (status === 'available') await circ.promoteNextHold(it.biblio_id);
-  await A.audit(req, 'item.status', { barcode: it.barcode, status });
-  res.json({ ok: true });
+  if (hasStatus) {
+    await sql.prepare(`UPDATE items SET status=? WHERE id=?`).run(status, it.id);
+    if (status === 'available') await circ.promoteNextHold(it.biblio_id);
+  }
+  if (hasShelfNumber) await sql.prepare('UPDATE items SET shelf_number=? WHERE id=?').run(shelfNumber, it.id);
+  await A.audit(req, hasStatus ? 'item.status' : 'item.shelf_number', {
+    barcode: it.barcode, ...(hasStatus ? { status } : {}), ...(hasShelfNumber ? { shelfNumber } : {}),
+  });
+  res.json({ ok: true, ...(hasStatus ? { status } : {}), ...(hasShelfNumber ? { shelfNumber } : {}) });
 }));
 
 module.exports = r;

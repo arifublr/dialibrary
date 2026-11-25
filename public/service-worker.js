@@ -1,6 +1,6 @@
 /* Library Portal service worker: offline app shell only. No API caching (auth is live). */
-const VERSION = 'v4';
-const SHELL = ["/css/tokens.css", "/css/app.css", "/css/site.css", "/js/app.js", "/js/boot.js", "/js/landing.js", "/vendor/webauthn.js", "/app", "/"];
+const VERSION = 'v6';
+const SHELL = ["/css/tokens.css", "/css/app.css", "/css/site.css", "/js/app.js", "/js/app.js?v=6", "/js/boot.js", "/js/landing.js", "/vendor/webauthn.js", "/app", "/"];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(

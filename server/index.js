@@ -113,4 +113,6 @@ async function bootstrap() {
 if (require.main === module) {
   bootstrap().then(() => app.listen(cfg.PORT, '0.0.0.0', () => console.log(`  ${settings.get().libraryName} is open on port ${cfg.PORT}`)));
 }
+
+console.log(`Your application is running in: http://localhost:${cfg.PORT}`)
 module.exports = { app, bootstrap };

@@ -15,17 +15,10 @@ r.use((req, res, next) => {
 
 const FIELDS = { all: null, title: 'title', author: 'author', subject: 'subjects', isbn: 'isbn', callno: 'call_number' };
 
-function ftsQuery(raw, field) {
-  const terms = (raw.toLowerCase().match(/[\p{L}\p{N}]+/gu) || []).slice(0, 8);
-  if (!terms.length) return null;
-  const body = terms.map((t) => `${t}*`).join(' ');
-  const col = FIELDS[field];
-  return col ? `${col}: (${body})` : body;
-}
-
 const shape = (b, av) => ({
   id: b.id, title: b.title, author: b.author, year: b.year, publisher: b.publisher, language: b.language,
-  subjects: b.subjects ? b.subjects.split('|') : [], callNumber: b.call_number, isbn: b.isbn,
+  subjects: b.subjects ? b.subjects.split('|') : [], searchAliases: b.search_aliases ? b.search_aliases.split('|') : [],
+  callNumber: b.call_number, isbn: b.isbn,
   copies: (av[b.id] || {}).copies || 0, available: (av[b.id] || {}).available || 0, nextDue: (av[b.id] || {}).nextDue || null,
 });
 
@@ -39,36 +32,30 @@ r.get('/search', wrap(async (req, res) => {
   const per = 12;
 
   const where = [], args = [];
-  let from = 'biblio b';
+  const from = 'biblio b';
   if (q) {
-    if (sql.isPg) {
-      const term = `%${q}%`;
-      if (field === 'title') {
-        where.push('b.title ILIKE ?'); args.push(term);
-      } else if (field === 'author') {
-        where.push('b.author ILIKE ?'); args.push(term);
-      } else if (field === 'subject') {
-        where.push('b.subjects ILIKE ?'); args.push(term);
-      } else if (field === 'isbn') {
-        where.push('b.isbn ILIKE ?'); args.push(term);
-      } else if (field === 'callno') {
-        where.push('b.call_number ILIKE ?'); args.push(term);
-      } else {
-        where.push('(b.title ILIKE ? OR b.author ILIKE ? OR b.subjects ILIKE ? OR b.isbn ILIKE ? OR b.call_number ILIKE ? OR b.publisher ILIKE ?)');
-        args.push(term, term, term, term, term, term);
-      }
+    const op = sql.isPg ? 'ILIKE' : 'LIKE';
+    const term = `%${q}%`;
+    if (field === 'title') {
+      where.push(`(b.title ${op} ? OR b.search_aliases ${op} ?)`); args.push(term, term);
+    } else if (field === 'author') {
+      where.push(`(b.author ${op} ? OR b.search_aliases ${op} ?)`); args.push(term, term);
+    } else if (field === 'subject') {
+      where.push(`b.subjects ${op} ?`); args.push(term);
+    } else if (field === 'isbn') {
+      where.push(`b.isbn ${op} ?`); args.push(term);
+    } else if (field === 'callno') {
+      where.push(`b.call_number ${op} ?`); args.push(term);
     } else {
-      const m = ftsQuery(q, field);
-      if (!m) return res.json({ total: 0, page, per, results: [], facets: { subjects: [], languages: [] } });
-      from = 'biblio b JOIN biblio_fts f ON f.rowid = b.id';
-      where.push('biblio_fts MATCH ?'); args.push(m);
+      where.push(`(b.title ${op} ? OR b.author ${op} ? OR b.search_aliases ${op} ? OR b.subjects ${op} ? OR b.isbn ${op} ? OR b.call_number ${op} ? OR b.publisher ${op} ? OR b.description ${op} ?)`);
+      args.push(term, term, term, term, term, term, term, term);
     }
   }
   if (subject) { where.push(`('|'||b.subjects||'|') LIKE ?`); args.push(`%|${subject.replace(/[%_]/g, '')}|%`); }
   if (language) { where.push('b.language = ?'); args.push(language); }
   if (onlyAvail) where.push(`EXISTS (SELECT 1 FROM items i WHERE i.biblio_id=b.id AND i.status='available')`);
   const W = where.length ? `WHERE ${where.join(' AND ')}` : '';
-  const order = (!sql.isPg && q) ? 'ORDER BY rank' : 'ORDER BY LOWER(b.title)';
+  const order = 'ORDER BY LOWER(b.title)';
 
   const total = (await sql.prepare(`SELECT COUNT(*) c FROM ${from} ${W}`).get(...args)).c;
   const rows = await sql.prepare(`SELECT b.* FROM ${from} ${W} ${order} LIMIT ? OFFSET ?`).all(...args, per, (page - 1) * per);
@@ -85,6 +72,30 @@ r.get('/search', wrap(async (req, res) => {
   res.json({ total, page, per, results: rows.map((b) => shape(b, av)), facets: { subjects: top(sc, 12), languages: top(lc, 6) } });
 }));
 
+r.get('/offline-catalogue', wrap(async (req, res) => {
+  const rows = await sql.prepare(`SELECT b.*, COUNT(i.id) copies,
+    SUM(CASE WHEN i.status='available' THEN 1 ELSE 0 END) available
+    FROM biblio b LEFT JOIN items i ON i.biblio_id=b.id
+    GROUP BY b.id ORDER BY LOWER(b.title), b.id`).all();
+  const copies = await sql.prepare('SELECT biblio_id, location, shelf_number, status FROM items ORDER BY biblio_id, id').all();
+  const copiesByBook = new Map();
+  for (const copy of copies) {
+    if (!copiesByBook.has(copy.biblio_id)) copiesByBook.set(copy.biblio_id, []);
+    copiesByBook.get(copy.biblio_id).push({
+      location: copy.location, shelfNumber: copy.shelf_number, status: copy.status,
+    });
+  }
+  res.json({
+    generatedAt: new Date().toISOString(),
+    results: rows.map((b) => ({
+      ...shape(b, { [b.id]: { copies: Number(b.copies), available: Number(b.available) } }),
+      description: b.description,
+      searchAliases: b.search_aliases ? b.search_aliases.split('|') : [],
+      items: copiesByBook.get(b.id) || [],
+    })),
+  });
+}));
+
 r.get('/new', wrap(async (req, res) => {
   const rows = await sql.prepare(`SELECT * FROM biblio ORDER BY id DESC LIMIT 8`).all();
   const av = await circ.availabilityMap(rows.map((b) => b.id));
@@ -96,10 +107,17 @@ r.get('/biblio/:id', wrap(async (req, res) => {
   const b = await sql.prepare(`SELECT * FROM biblio WHERE id=?`).get(id);
   if (!b) throw new HttpError(404, 'Record not found');
   const av = await circ.availabilityMap([id]);
-  const items = await sql.prepare(`SELECT i.id, i.barcode, i.location, i.status,
+  const items = await sql.prepare(`SELECT i.id, i.barcode, i.location, i.shelf_number, i.status,
     (SELECT due_at FROM loans WHERE item_id=i.id AND returned_at IS NULL) dueAt FROM items i WHERE biblio_id=? ORDER BY i.id`).all(id);
   const holds = (await circ.pendingHolds(id)).length;
-  const out = { ...shape(b, av), description: b.description, items: items.map((i) => ({ ...i, barcode: req.user && req.user.role !== 'student' ? i.barcode : undefined })), holds };
+  const out = {
+    ...shape(b, av), description: b.description,
+    items: items.map((i) => ({
+      id: i.id, location: i.location, shelfNumber: i.shelf_number, status: i.status, dueAt: i.dueAt,
+      barcode: req.user && req.user.role !== 'student' ? i.barcode : undefined,
+    })),
+    holds,
+  };
   if (req.user && req.user.role === 'student') {
     const { nosql } = require('../db');
     out.myHold = await nosql.holds.findOneAsync({ patronId: req.user._id, biblioId: id, status: { $in: ['pending', 'waiting'] } });

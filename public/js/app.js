@@ -35,6 +35,130 @@ async function api(path, { method = 'GET', body, text } = {}) {
   }
   return data;
 }
+const OFFLINE_DB = 'dialibrary-opac';
+const OFFLINE_SCHEMA = 2;
+let offlineDbRequest;
+let offlineSyncPromise;
+let offlineCatalogueMemory;
+function openOfflineDb() {
+  if (!('indexedDB' in window)) return Promise.reject(new Error('This browser does not support offline catalogue storage.'));
+  if (!offlineDbRequest) {
+    offlineDbRequest = new Promise((resolve, reject) => {
+      const request = indexedDB.open(OFFLINE_DB, OFFLINE_SCHEMA);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains('books')) db.createObjectStore('books', { keyPath: 'id' });
+        if (!db.objectStoreNames.contains('meta')) db.createObjectStore('meta', { keyPath: 'key' });
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => {
+        offlineDbRequest = null;
+        reject(request.error || new Error('Could not open offline catalogue storage.'));
+      };
+    });
+  }
+  return offlineDbRequest;
+}
+async function getOfflineCatalogue() {
+  if (offlineCatalogueMemory) return offlineCatalogueMemory;
+  const db = await openOfflineDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(['books', 'meta'], 'readonly');
+    const books = tx.objectStore('books').getAll();
+    const meta = tx.objectStore('meta').get('catalogue');
+    tx.oncomplete = () => {
+      offlineCatalogueMemory = {
+        books: books.result || [],
+        syncedAt: meta.result ? meta.result.syncedAt : null,
+        schemaVersion: meta.result ? meta.result.schemaVersion : null,
+      };
+      resolve(offlineCatalogueMemory);
+    };
+    tx.onerror = () => reject(tx.error || new Error('Could not read the offline catalogue.'));
+    tx.onabort = () => reject(tx.error || new Error('Could not read the offline catalogue.'));
+  });
+}
+async function getOfflineCatalogueMeta() {
+  if (offlineCatalogueMemory) return {
+    syncedAt: offlineCatalogueMemory.syncedAt,
+    schemaVersion: offlineCatalogueMemory.schemaVersion,
+  };
+  const db = await openOfflineDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('meta', 'readonly');
+    const meta = tx.objectStore('meta').get('catalogue');
+    tx.oncomplete = () => resolve({
+      syncedAt: meta.result ? meta.result.syncedAt : null,
+      schemaVersion: meta.result ? meta.result.schemaVersion : null,
+    });
+    tx.onerror = () => reject(tx.error || new Error('Could not read the offline catalogue status.'));
+    tx.onabort = () => reject(tx.error || new Error('Could not read the offline catalogue status.'));
+  });
+}
+async function saveOfflineCatalogue(results, syncedAt) {
+  const db = await openOfflineDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(['books', 'meta'], 'readwrite');
+    const books = tx.objectStore('books');
+    books.clear();
+    for (const book of results) books.put(book);
+    tx.objectStore('meta').put({ key: 'catalogue', syncedAt, schemaVersion: OFFLINE_SCHEMA });
+    tx.oncomplete = () => {
+      offlineCatalogueMemory = { books: results, syncedAt, schemaVersion: OFFLINE_SCHEMA };
+      resolve();
+    };
+    tx.onerror = () => reject(tx.error || new Error('Could not save the offline catalogue.'));
+    tx.onabort = () => reject(tx.error || new Error('Could not save the offline catalogue.'));
+  });
+}
+async function syncOfflineCatalogue(force = false) {
+  if (offlineSyncPromise) return offlineSyncPromise;
+  offlineSyncPromise = (async () => {
+    const meta = await getOfflineCatalogueMeta();
+    const age = meta.syncedAt ? Date.now() - new Date(meta.syncedAt).getTime() : Infinity;
+    if (!force && (!navigator.onLine || (meta.schemaVersion === OFFLINE_SCHEMA && meta.syncedAt && age < 6 * 60 * 60 * 1000))) return meta;
+    if (!navigator.onLine) return meta;
+    const data = await api('/opac/offline-catalogue');
+    await saveOfflineCatalogue(data.results, data.generatedAt);
+    return { syncedAt: data.generatedAt };
+  })();
+  try { return await offlineSyncPromise; }
+  finally { offlineSyncPromise = null; }
+}
+const normalizedSearch = (value) => String(value || '').normalize('NFKC').toLocaleLowerCase()
+  .replace(/[\u064B-\u065F\u0670\u0640]/g, '').replace(/[أإآٱ]/g, 'ا').replace(/ى/g, 'ي');
+function searchOfflineCatalogue(catalogue) {
+  const terms = normalizedSearch(Q.q).split(/\s+/).filter(Boolean);
+  const fields = {
+    title: (b) => [b.title, ...(b.searchAliases || [])],
+    author: (b) => [b.author, ...(b.searchAliases || [])],
+    subject: (b) => b.subjects || [],
+    isbn: (b) => [b.isbn],
+    callno: (b) => [b.callNumber],
+    all: (b) => [b.title, b.author, ...(b.searchAliases || []), ...(b.subjects || []), b.isbn, b.callNumber, b.publisher, b.description],
+  };
+  const matched = catalogue.books.filter((book) => {
+    if (Q.available && !book.available) return false;
+    if (Q.language && book.language !== Q.language) return false;
+    if (Q.subject && !(book.subjects || []).includes(Q.subject)) return false;
+    const text = normalizedSearch(fields[Q.field](book).join(' '));
+    return terms.every((term) => text.includes(term));
+  });
+  const subjects = {}, languages = {};
+  for (const book of matched) {
+    for (const subject of book.subjects || []) subjects[subject] = (subjects[subject] || 0) + 1;
+    languages[book.language] = (languages[book.language] || 0) + 1;
+  }
+  const top = (values, limit) => Object.entries(values).sort((a, b) => b[1] - a[1]).slice(0, limit)
+    .map(([name, count]) => ({ name, count }));
+  const sorted = matched.sort((a, b) => String(a.title).localeCompare(String(b.title)));
+  const per = 12;
+  return {
+    total: sorted.length, page: Q.page, per,
+    results: sorted.slice((Q.page - 1) * per, Q.page * per),
+    facets: { subjects: top(subjects, 12), languages: top(languages, 6) },
+  };
+}
 function toast(msg, kind = '') {
   const t = document.createElement('div'); t.className = 'toast ' + kind; t.textContent = msg;
   $('#toasts').append(t); setTimeout(() => t.remove(), kind === 'err' ? 6000 : 3500);
@@ -69,7 +193,7 @@ const cover = (title, big) => { let s = 0; for (const c of title) s = (s * 31 + 
 const NAV = {
   student: [['search', 'Catalogue', 'search'], ['account', 'My library', 'book'], ['security', 'Security', 'shield'], ['install', 'Install app', 'install']],
   librarian: [['dashboard', 'Overview', 'home'], ['desk', 'Desk', 'desk'], ['patrons', 'Students', 'users'], ['loans', 'Loans', 'clock'], ['holds', 'Holds', 'list'], ['search', 'Catalogue', 'search'], ['security', 'Security', 'shield'], ['install', 'Install app', 'install']],
-  admin: [['dashboard', 'Overview', 'home'], ['desk', 'Desk', 'desk'], ['patrons', 'Students', 'users'], ['loans', 'Loans', 'clock'], ['holds', 'Holds', 'list'], ['search', 'Catalogue', 'search'], ['settings', 'Settings', 'cog'], ['users', 'Accounts', 'user'], ['audit', 'Activity', 'log'], ['security', 'Security', 'shield'], ['install', 'Install app', 'install']],
+  admin: [['dashboard', 'Overview', 'home'], ['desk', 'Desk', 'desk'], ['patrons', 'Students', 'users'], ['loans', 'Loans', 'clock'], ['holds', 'Holds', 'list'], ['search', 'Catalogue', 'search'], ['settings', 'Settings', 'cog'], ['inventory', 'Stock check', 'list'], ['users', 'Accounts', 'user'], ['audit', 'Activity', 'log'], ['security', 'Security', 'shield'], ['install', 'Install app', 'install']],
 };
 const home = () => ({ student: 'search', librarian: 'dashboard', admin: 'dashboard' }[S.me.role]);
 const route = () => { const [name, ...rest] = (location.hash.slice(1) || '').split('/'); return { name, arg: rest.join('/') }; };
@@ -215,10 +339,11 @@ VIEWS.search = () => {
   view(h`
   <div class="page-head"><div><h1>Catalogue</h1><p>Search ${S.cfg.libraryName} by title, author, subject, ISBN or call number.</p></div></div>
   <form class="searchbar" id="searchform" role="search">
-    <input type="search" id="q" placeholder="Try “physics”, “Basheer” or “algorithms”" value="${Q.q}" aria-label="Search the catalogue" autocomplete="off">
+    <input type="search" id="q" placeholder="Search in any script or transliteration" value="${Q.q}" aria-label="Search the catalogue" autocomplete="off">
     <select id="field" aria-label="Search in">${[['all', 'Everything'], ['title', 'Title'], ['author', 'Author'], ['subject', 'Subject'], ['isbn', 'ISBN'], ['callno', 'Call number']].map(([v, l]) => h`<option value="${v}" ${Q.field === v ? raw('selected') : ''}>${l}</option>`)}</select>
     <button class="btn" type="submit">${ico('search')} Search</button>
   </form>
+  <div id="catalog-sync" class="hint" role="status" style="margin-top:.7rem"></div>
   <div class="filters" id="filters"></div>
   <div id="results"></div>`);
   runSearch();
@@ -229,40 +354,84 @@ async function runSearch() {
   try {
     const showNew = !Q.q && !Q.subject && !Q.language && !Q.available;
     const [d, fresh] = await Promise.all([api('/opac/search?' + p), showNew && Q.page === 1 ? api('/opac/new') : null]);
-    const f = $('#filters');
-    f.innerHTML = h`<button class="chip" data-act="avail" aria-pressed="${Q.available}">In now</button>
-      ${d.facets.languages.length > 1 ? d.facets.languages.map((l) => h`<button class="chip" data-act="lang" data-v="${l.name}" aria-pressed="${Q.language === l.name}">${l.name} <small>${l.count}</small></button>`) : ''}
-      ${d.facets.subjects.map((s) => h`<button class="chip" data-act="subject" data-v="${s.name}" aria-pressed="${Q.subject === s.name}">${s.name} <small>${s.count}</small></button>`)}
-      ${Q.q || Q.subject || Q.language || Q.available ? h`<button class="chip" data-act="clear-filters">Clear all</button>` : ''}`.s;
-    const grid = (list) => h`<div class="books">${list.map((b, i) => h`<button class="book" data-act="open-book" data-id="${b.id}" style="--i:${i}">${cover(b.title)}<div class="book-info"><h3>${b.title}</h3><span class="by">${b.author}${b.year ? ' · ' + b.year : ''}</span><span class="muted small">${b.callNumber}</span><div>${availPill(b)}</div></div></button>`)}</div>`;
-    const pages = Math.ceil(d.total / d.per);
-    box.innerHTML = h`
-      ${fresh ? h`<h2 style="margin:1.6rem 0 0;font-size:1.3rem">New arrivals</h2>${grid(fresh.results)}<h2 style="margin:2rem 0 0;font-size:1.3rem">All books</h2>` : h`<p class="muted" style="margin-top:1.2rem"><b>${d.total}</b> ${d.total === 1 ? 'result' : 'results'}</p>`}
-      ${d.results.length ? grid(d.results) : emptyState('Nothing matched. Try fewer words or clear the filters.')}
-      ${pages > 1 ? h`<div class="pager"><button class="btn ghost small" data-act="page" data-v="${Q.page - 1}" ${Q.page <= 1 ? raw('disabled') : ''}>Previous</button><span class="muted">Page ${d.page} of ${pages}</span><button class="btn ghost small" data-act="page" data-v="${Q.page + 1}" ${Q.page >= pages ? raw('disabled') : ''}>Next</button></div>` : ''}`.s;
-  } catch (e) { box.innerHTML = h`<div class="error" style="margin-top:1rem">${e.message}</div>`.s; }
+    renderSearchResults(d, fresh, false);
+    syncOfflineCatalogue().then((cached) => showCatalogueSync('online', cached.syncedAt)).catch((e) => {
+      showCatalogueSync('sync-error', null, e.message);
+    });
+  } catch (e) {
+    if (navigator.onLine !== false && !(e instanceof TypeError)) {
+      box.innerHTML = h`<div class="error" style="margin-top:1rem">${e.message}</div>`.s;
+      return;
+    }
+    try {
+      const cached = await getOfflineCatalogue();
+      if (!cached.books.length) throw new Error('No offline catalogue is saved on this device yet. Connect once and open the catalogue to sync it.');
+      const d = searchOfflineCatalogue(cached);
+      const showNew = !Q.q && !Q.subject && !Q.language && !Q.available && Q.page === 1;
+      const fresh = showNew ? { results: [...cached.books].sort((a, b) => b.id - a.id).slice(0, 8) } : null;
+      renderSearchResults(d, fresh, true);
+      showCatalogueSync('offline', cached.syncedAt);
+    } catch (offlineError) {
+      box.innerHTML = h`<div class="error" style="margin-top:1rem">${offlineError.message}</div>`.s;
+      showCatalogueSync('offline-error');
+    }
+  }
+}
+function showCatalogueSync(mode, syncedAt, error) {
+  const status = $('#catalog-sync');
+  if (!status) return;
+  const when = syncedAt ? new Date(syncedAt).toLocaleString() : '';
+  if (mode === 'offline') status.textContent = `Offline catalogue · Last synced ${when || 'unknown'}. Availability may have changed.`;
+  else if (mode === 'offline-error') status.textContent = 'Offline catalogue could not be opened on this device.';
+  else if (mode === 'syncing') status.textContent = 'Updating the catalogue saved on this device…';
+  else if (mode === 'sync-error') status.textContent = `Online search works, but the offline catalogue could not update: ${error}`;
+  else status.innerHTML = h`Offline search is ready · Last synced ${when || 'just now'} <button class="btn ghost small" data-act="sync-catalogue">Update now</button>`.s;
+}
+function renderSearchResults(d, fresh, offline) {
+  const box = $('#results'); if (!box) return;
+  const f = $('#filters');
+  f.innerHTML = h`<button class="chip" data-act="avail" aria-pressed="${Q.available}">In now</button>
+    ${d.facets.languages.length > 1 ? d.facets.languages.map((l) => h`<button class="chip" data-act="lang" data-v="${l.name}" aria-pressed="${Q.language === l.name}">${l.name} <small>${l.count}</small></button>`) : ''}
+    ${d.facets.subjects.map((s) => h`<button class="chip" data-act="subject" data-v="${s.name}" aria-pressed="${Q.subject === s.name}">${s.name} <small>${s.count}</small></button>`)}
+    ${Q.q || Q.subject || Q.language || Q.available ? h`<button class="chip" data-act="clear-filters">Clear all</button>` : ''}`.s;
+  const grid = (list) => h`<div class="books">${list.map((b, i) => h`<button class="book" data-act="open-book" data-id="${b.id}" style="--i:${i}">${cover(b.title)}<div class="book-info"><h3>${b.title}</h3><span class="by">${b.author}${b.year ? ' · ' + b.year : ''}</span><span class="muted small">${b.callNumber}</span><div>${availPill(b)}</div></div></button>`)}</div>`;
+  const pages = Math.ceil(d.total / d.per);
+  box.innerHTML = h`
+    ${fresh ? h`<h2 style="margin:1.6rem 0 0;font-size:1.3rem">New arrivals</h2>${grid(fresh.results)}<h2 style="margin:2rem 0 0;font-size:1.3rem">All books</h2>` : h`<p class="muted" style="margin-top:1.2rem"><b>${d.total}</b> ${d.total === 1 ? 'result' : 'results'}${offline ? ' · saved catalogue' : ''}</p>`}
+    ${d.results.length ? grid(d.results) : emptyState('Nothing matched. Try fewer words or clear the filters.')}
+    ${pages > 1 ? h`<div class="pager"><button class="btn ghost small" data-act="page" data-v="${Q.page - 1}" ${Q.page <= 1 ? raw('disabled') : ''}>Previous</button><span class="muted">Page ${d.page} of ${pages}</span><button class="btn ghost small" data-act="page" data-v="${Q.page + 1}" ${Q.page >= pages ? raw('disabled') : ''}>Next</button></div>` : ''}`.s;
 }
 async function openBook(id) {
   try {
-    const b = await api('/opac/biblio/' + id);
+    let b, offline = false;
+    try { b = await api('/opac/biblio/' + id); }
+    catch (e) {
+      if (navigator.onLine !== false && !(e instanceof TypeError)) throw e;
+      const cached = await getOfflineCatalogue();
+      b = cached.books.find((book) => String(book.id) === String(id));
+      if (!b) throw new Error('This book is not in the saved offline catalogue.');
+      offline = true;
+      b = { ...b, items: b.items || [], searchAliases: b.searchAliases || [], holds: 0 };
+    }
     const staff = S.me && S.me.role !== 'student', stu = S.me && S.me.role === 'student';
     openModal(h`
       <h2>${b.title}</h2><p class="muted">${b.author}</p>
+      ${offline ? h`<p class="hint">Saved catalogue record. Availability may have changed; reservations need an internet connection.</p>` : ''}
       <div class="detail-top">${cover(b.title, true)}
         <div class="grow stack" style="gap:.8rem">
           <div class="row">${availPill(b)} ${b.holds ? h`<span class="pill">${b.holds} waiting</span>` : ''}</div>
-          <dl class="kv"><dt>Call number</dt><dd>${b.callNumber || '—'}</dd><dt>Published</dt><dd>${[b.publisher, b.year].filter(Boolean).join(', ') || '—'}</dd><dt>Language</dt><dd>${b.language}</dd><dt>ISBN</dt><dd>${b.isbn || '—'}</dd><dt>Subjects</dt><dd>${b.subjects.join(', ') || '—'}</dd></dl>
+          <dl class="kv"><dt>Call number</dt><dd>${b.callNumber || '—'}</dd><dt>Published</dt><dd>${[b.publisher, b.year].filter(Boolean).join(', ') || '—'}</dd><dt>Language</dt><dd>${b.language}</dd><dt>ISBN</dt><dd>${b.isbn || '—'}</dd><dt>Subjects</dt><dd>${b.subjects.join(', ') || '—'}</dd><dt>Also searched as</dt><dd>${b.searchAliases.join(', ') || '—'}</dd></dl>
         </div></div>
       ${b.description ? h`<p>${b.description}</p>` : ''}
-      <h3 style="margin-top:1.2rem;font-size:1.05rem">Copies</h3>
-      <div class="copies">${b.items.map((i) => h`<div class="copy"><span><b>${i.location}</b>${staff ? h` <span class="muted small">· ${i.barcode}</span>` : ''}</span>
+      <h3 style="margin-top:1.2rem;font-size:1.05rem">Copies and shelf numbers</h3>
+      <div class="copies">${b.items.map((i) => h`<div class="copy"><span><b>Shelf number: ${i.shelfNumber || 'Not recorded'}</b><span class="muted small"> · ${i.location || 'Library'}</span>${staff && !offline ? h` <span class="muted small">· ${i.barcode}</span><label class="field small" style="max-width:180px;margin-top:.4rem">Edit shelf number<input type="text" data-shelf-item="${i.barcode}" value="${i.shelfNumber || ''}" maxlength="40"></label>` : ''}</span>
         <span class="row" style="gap:.4rem">${i.status === 'available' ? h`<span class="pill ok">On the shelf</span>` : i.status === 'checked_out' ? h`<span class="pill warn">Out${i.dueAt ? ' · due ' + fmtDate(i.dueAt) : ''}</span>` : i.status === 'on_hold' ? h`<span class="pill">On hold shelf</span>` : h`<span class="pill bad">${i.status.replace('_', ' ')}</span>`}
-        ${staff && i.status !== 'checked_out' ? h`<select data-item="${i.barcode}" style="width:auto;padding:.3rem .6rem;border-radius:10px" aria-label="Change status">${['available', 'repair', 'lost', 'withdrawn'].map((s) => h`<option value="${s}" ${i.status === s ? raw('selected') : ''}>${s}</option>`)}</select>` : ''}</span></div>`)}</div>
+        ${staff && !offline && i.status !== 'checked_out' ? h`<select data-item="${i.barcode}" style="width:auto;padding:.3rem .6rem;border-radius:10px" aria-label="Change status">${['available', 'repair', 'lost', 'withdrawn'].map((s) => h`<option value="${s}" ${i.status === s ? raw('selected') : ''}>${s}</option>`)}</select>` : ''}</span></div>`)}</div>
       <div class="row" style="margin-top:1.4rem">
-        ${stu ? (b.myHold ? h`<button class="btn soft" data-act="cancel-hold" data-id="${b.myHold._id}" data-bib="${b.id}">${b.myHold.status === 'waiting' ? 'Cancel pickup' : 'Cancel reservation'}</button>${b.myHold.status === 'waiting' ? h`<span class="pill ok">Ready at the desk until ${fmtDate(b.myHold.expiresAt)}</span>` : h`<span class="pill">In the queue</span>`}` : h`<button class="btn" data-act="reserve" data-id="${b.id}">${b.available > 0 ? 'Reserve for pickup' : 'Join the queue'}</button>`) : ''}
-        ${stu ? h`<button class="btn ghost" data-act="shelf" data-id="${b.id}">${b.saved ? '★ In my list' : '☆ Save to my list'}</button>` : ''}
-        ${staff ? h`<button class="btn soft" data-act="add-copy" data-id="${b.id}">${ico('plus')} Add a copy</button>` : ''}
-        ${!S.me ? h`<a class="btn" href="/app">Sign in to reserve</a>` : ''}
+        ${stu && !offline ? (b.myHold ? h`<button class="btn soft" data-act="cancel-hold" data-id="${b.myHold._id}" data-bib="${b.id}">${b.myHold.status === 'waiting' ? 'Cancel pickup' : 'Cancel reservation'}</button>${b.myHold.status === 'waiting' ? h`<span class="pill ok">Ready at the desk until ${fmtDate(b.myHold.expiresAt)}</span>` : h`<span class="pill">In the queue</span>`}` : h`<button class="btn" data-act="reserve" data-id="${b.id}">${b.available > 0 ? 'Reserve for pickup' : 'Join the queue'}</button>`) : ''}
+        ${stu && !offline ? h`<button class="btn ghost" data-act="shelf" data-id="${b.id}">${b.saved ? '★ In my list' : '☆ Save to my list'}</button>` : ''}
+        ${staff && !offline ? h`<button class="btn soft" data-act="add-copy" data-id="${b.id}">${ico('plus')} Add a copy</button>` : ''}
+        ${!S.me && !offline ? h`<a class="btn" href="/app">Sign in to reserve</a>` : ''}
       </div>`);
   } catch (e) { toast(e.message, 'err'); }
 }
@@ -393,6 +562,33 @@ const SET_FIELDS = {
   Loans: [['loanDays', 'Loan period (days)', 'number'], ['maxRenewals', 'Renewals allowed', 'number'], ['maxLoans', 'Books per student', 'number'], ['maxHolds', 'Reservations per student', 'number'], ['holdWaitDays', 'Hold shelf wait (days)', 'number']],
   Fines: [['graceDays', 'Grace period (days)', 'number'], ['finePerDay', 'Fine per day', 'number'], ['maxFine', 'Maximum fine per book', 'number'], ['blockCheckoutAtFines', 'Pause new loans at unpaid total', 'number'], ['lostAfterDays', 'Treat as lost after (days late)', 'number'], ['lostCharge', 'Lost book charge', 'number']],
 };
+VIEWS.inventory = async () => {
+  const q = S.tmp.inventoryQ || '';
+  view(h`<div class="page-head"><div><h1>Stock check</h1><p>Mark each physical copy found or missing. This is separate from its loan status.</p></div></div>
+    <form class="searchbar" id="inventorysearch" role="search"><input type="search" name="q" value="${q}" placeholder="Search title, author or barcode" aria-label="Search stock"><button class="btn" type="submit">${ico('search')} Find</button></form>
+    <div id="inventory-counts" class="filters" style="margin-top:1rem"></div><div class="card" id="inventory-list" style="margin-top:1rem">Loading…</div>`);
+  loadInventory();
+};
+async function loadInventory() {
+  const box = $('#inventory-list');
+  if (!box) return;
+  const status = S.tmp.inventoryStatus || 'all';
+  const p = new URLSearchParams({ q: S.tmp.inventoryQ || '', status, page: S.tmp.inventoryPage || 1 });
+  try {
+    const d = await api('/admin/inventory?' + p);
+    $('#inventory-counts').innerHTML = h`${[['all', 'All copies', d.counts.total], ['unchecked', 'Not checked', d.counts.unchecked], ['available', 'Available', d.counts.available], ['missing', 'Missing', d.counts.missing]].map(([key, label, count]) => h`<button class="chip" data-act="inventory-filter" data-v="${key}" aria-pressed="${status === key}">${label} <small>${count}</small></button>`)}`.s;
+    const pages = Math.ceil(d.total / d.per);
+    box.innerHTML = d.items.length ? h`<div class="table-wrap"><table><thead><tr><th>Title / author</th><th>Barcode / location</th><th>Loan status</th><th>Physical check</th></tr></thead><tbody>${d.items.map((item) => h`<tr>
+      <td class="cell-title"><b>${item.title}</b><span>${item.author || 'Author not recorded'}</span></td>
+      <td class="cell-title"><b>${item.barcode}</b><span>${item.shelf_number || 'Shelf number not recorded'} · ${item.location}</span></td>
+      <td>${String(item.item_status).replace('_', ' ')}</td>
+      <td><div class="row" style="gap:.8rem">
+        <label class="check"><input type="checkbox" data-inventory-id="${item.id}" data-inventory-status="available" ${item.inventory_status === 'available' ? raw('checked') : ''}> Available</label>
+        <label class="check"><input type="checkbox" data-inventory-id="${item.id}" data-inventory-status="missing" ${item.inventory_status === 'missing' ? raw('checked') : ''}> Missing</label>
+      </div></td></tr>`)}</tbody></table></div>${pages > 1 ? h`<div class="pager"><button class="btn ghost small" data-act="inventory-page" data-v="${Number(d.page) - 1}" ${d.page <= 1 ? raw('disabled') : ''}>Previous</button><span class="muted">Page ${d.page} of ${pages} · ${d.total} copies</span><button class="btn ghost small" data-act="inventory-page" data-v="${Number(d.page) + 1}" ${d.page >= pages ? raw('disabled') : ''}>Next</button></div>` : ''}`.s
+      : emptyState(status === 'missing' ? 'No copies marked missing.' : status === 'unchecked' ? 'All copies in this view have been checked.' : 'No copies matched.');
+  } catch (e) { box.innerHTML = h`<div class="error">${e.message}</div>`.s; }
+}
 VIEWS.settings = async () => {
   view(h`<div class="page-head"><div><h1>Settings</h1><p>Loan rules, fines and data uploads.</p></div></div><div id="setbox" class="stack"><div class="empty">Loading…</div></div>`);
   try {
@@ -406,7 +602,7 @@ VIEWS.settings = async () => {
     </form>
     <div class="card"><h2>Upload data</h2><p class="muted" style="margin-bottom:1rem">Import many records at once from a CSV file. Existing titles are matched by ISBN or title and author, then extra copies are added.</p>
       <div class="grid cols-2">
-        <div class="dropzone" data-drop="catalog"><b>Books and copies</b><p class="hint" style="margin:.4rem 0 1rem">Columns: title, author, isbn, publisher, year, language, subjects, call_number, copies, location, description</p><input type="file" id="f-catalog" accept=".csv,text/csv" class="sr-only"><label for="f-catalog" class="btn soft small" style="cursor:pointer">${ico('plus')} Choose CSV</label> <button type="button" class="btn ghost small" data-act="template" data-v="catalog">Download template</button></div>
+        <div class="dropzone" data-drop="catalog"><b>Books and copies</b><p class="hint" style="margin:.4rem 0 1rem">Columns: title, author, search_aliases (alternate scripts / transliterations separated by |), isbn, publisher, year, language, subjects, call_number, copies, location, shelf_number, description</p><input type="file" id="f-catalog" accept=".csv,text/csv" class="sr-only"><label for="f-catalog" class="btn soft small" style="cursor:pointer">${ico('plus')} Choose CSV</label> <button type="button" class="btn ghost small" data-act="template" data-v="catalog">Download template</button></div>
         <div class="dropzone" data-drop="patrons"><b>Students</b><p class="hint" style="margin:.4rem 0 1rem">Columns: name, card_number, username, email, department, class</p><input type="file" id="f-patrons" accept=".csv,text/csv" class="sr-only"><label for="f-patrons" class="btn soft small" style="cursor:pointer">${ico('plus')} Choose CSV</label> <button type="button" class="btn ghost small" data-act="template" data-v="patrons">Download template</button></div>
       </div><div id="importresult" style="margin-top:1rem"></div></div>
     <div class="card"><h2>Export and backup</h2><div class="row"><a class="btn soft" href="/api/admin/export/catalog.csv" download>Catalogue (CSV)</a><a class="btn soft" href="/api/admin/export/backup.json" download>Full backup (JSON)</a></div><p class="hint" style="margin-top:.7rem">Backups leave out passwords and passkeys.</p></div>
@@ -423,7 +619,7 @@ function updateFinePreview() {
   $('#finepreview').innerHTML = h`A book returned <b>${days}</b> days late costs <b style="color:var(--red)">${cur}${amt}</b> <span class="muted">(${bill} billable days × ${cur}${n('finePerDay')}, max ${cur}${n('maxFine')})</span>`.s;
 }
 const TEMPLATES = {
-  catalog: 'title,author,isbn,publisher,year,language,subjects,call_number,copies,location,description\r\n"Example Book","A. Writer",9780000000002,"Example Press",2024,English,"Fiction|Classics","823 WRI",2,"Main Shelves","A short summary."\r\n',
+  catalog: 'title,author,search_aliases,isbn,publisher,year,language,subjects,call_number,copies,location,shelf_number,description\r\n"Example Book","A. Writer","Example alternate title|Example transliteration",9780000000002,"Example Press",2024,English,"Fiction|Classics","823 WRI",2,"Main Shelves","823 WRI 001","A short summary."\r\n',
   patrons: 'name,card_number,username,email,department,class\r\n"Example Student",S20260101,example.student,example@example.org,"BSc Physics","Year 1"\r\n',
 };
 async function runImport(kind, file) {
@@ -572,14 +768,15 @@ function secretModal(title, line, pw) {
   openModal(h`<h2>${title}</h2><p style="margin:1rem 0">${line}</p><p><span class="secret">${pw}</span></p><p class="hint" style="margin-top:1rem">Share this once. It is not shown again, and they must choose a new password at first sign-in.</p><div class="row" style="margin-top:1rem"><button class="btn" data-act="close-modal">Done</button></div>`);
 }
 function copyForm(id) {
-  openModal(h`<h2>Add a copy</h2><form class="stack" id="newcopy" data-id="${id}" style="margin-top:1rem"><label class="field">Barcode<input type="text" name="barcode" placeholder="Leave blank to generate" maxlength="40"></label><label class="field">Location<input type="text" name="location" value="Main Shelves" maxlength="60"></label><div id="m-err" class="error hidden"></div><button class="btn" type="submit">Add copy</button></form>`);
+  openModal(h`<h2>Add a copy</h2><form class="stack" id="newcopy" data-id="${id}" style="margin-top:1rem"><label class="field">Barcode<input type="text" name="barcode" placeholder="Leave blank to generate" maxlength="40"></label><label class="field">Location<input type="text" name="location" value="Main Shelves" maxlength="60"></label><label class="field">Shelf number<input type="text" name="shelfNumber" maxlength="40"></label><div id="m-err" class="error hidden"></div><button class="btn" type="submit">Add copy</button></form>`);
 }
 function titleForm() {
   openModal(h`<h2>Add a book</h2><form class="stack" id="newtitle" style="margin-top:1rem"><div class="form-grid">
     <label class="field">Title<input type="text" name="title" required maxlength="200"></label><label class="field">Author<input type="text" name="author" maxlength="150"></label>
     <label class="field">ISBN<input type="text" name="isbn" maxlength="20"></label><label class="field">Publisher<input type="text" name="publisher" maxlength="100"></label>
     <label class="field">Year<input type="number" name="year" min="1000" max="2100"></label><label class="field">Language<input type="text" name="language" value="English" maxlength="40"></label>
-    <label class="field">Call number<input type="text" name="callNumber" maxlength="40"></label><label class="field">Copies<input type="number" name="copies" value="1" min="1" max="20"></label></div>
+    <label class="field">Call number<input type="text" name="callNumber" maxlength="40"></label><label class="field">Shelf number<input type="text" name="shelfNumber" maxlength="40"></label><label class="field">Location<input type="text" name="location" value="Main Shelves" maxlength="60"></label><label class="field">Copies<input type="number" name="copies" value="1" min="1" max="20"></label></div>
+    <label class="field">Alternate names and transliterations<input type="text" name="searchAliases" placeholder="Separate variants with | (Arabic, Malayalam, Urdu, romanized names…)" maxlength="1000"></label>
     <label class="field">Subjects<input type="text" name="subjects" placeholder="Physics, Cosmology" maxlength="200"></label>
     <label class="field">Description<textarea name="description" maxlength="1500"></textarea></label>
     <div id="m-err" class="error hidden"></div><button class="btn" type="submit">Add to catalogue</button></form>`);
@@ -601,6 +798,13 @@ const ACTIONS = {
   lang: (el) => { Q.language = Q.language === el.dataset.v ? '' : el.dataset.v; Q.page = 1; runSearch(); },
   subject: (el) => { Q.subject = Q.subject === el.dataset.v ? '' : el.dataset.v; Q.page = 1; runSearch(); },
   'clear-filters': () => { Object.assign(Q, { q: '', field: 'all', subject: '', language: '', available: false, page: 1 }); VIEWS.search(); },
+  'sync-catalogue': async () => {
+    showCatalogueSync('syncing');
+    try { const cached = await syncOfflineCatalogue(true); showCatalogueSync('online', cached.syncedAt); toast('Offline catalogue updated', 'ok'); }
+    catch (e) { showCatalogueSync('sync-error', null, e.message); toast(e.message, 'err'); }
+  },
+  'inventory-filter': (el) => { S.tmp.inventoryStatus = el.dataset.v; S.tmp.inventoryPage = 1; loadInventory(); },
+  'inventory-page': (el) => { S.tmp.inventoryPage = Number(el.dataset.v); loadInventory(); },
   page: (el) => { Q.page = Number(el.dataset.v); runSearch(); scrollTo({ top: 0, behavior: 'smooth' }); },
   reserve: async (el) => { try { await api('/me/holds', { method: 'POST', body: { biblioId: Number(el.dataset.id) } }); toast('Reserved. We will tell you at the desk when it is ready.', 'ok'); openBook(el.dataset.id); } catch (e) { toast(e.message, 'err'); } },
   'cancel-hold': async (el) => { try { await api('/me/holds/' + el.dataset.id, { method: 'DELETE' }); toast('Reservation cancelled', 'ok'); if (el.dataset.bib) openBook(el.dataset.bib); else VIEWS.account(); } catch (e) { toast(e.message, 'err'); } },
@@ -630,6 +834,17 @@ document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal
 document.addEventListener('change', async (e) => {
   const t = e.target;
   if (t.dataset && t.dataset.item) { try { await api('/staff/items/' + encodeURIComponent(t.dataset.item), { method: 'PATCH', body: { status: t.value } }); toast('Copy updated', 'ok'); } catch (err) { toast(err.message, 'err'); } }
+  if (t.dataset && t.dataset.shelfItem) {
+    try { await api('/staff/items/' + encodeURIComponent(t.dataset.shelfItem), { method: 'PATCH', body: { shelfNumber: t.value.trim() } }); toast('Shelf number saved', 'ok'); }
+    catch (err) { toast(err.message, 'err'); }
+  }
+  if (t.dataset && t.dataset.inventoryId) {
+    const inventoryStatus = t.checked ? t.dataset.inventoryStatus : 'unchecked';
+    try {
+      await api('/admin/inventory/' + t.dataset.inventoryId, { method: 'PATCH', body: { inventoryStatus } });
+      await loadInventory();
+    } catch (err) { toast(err.message, 'err'); await loadInventory(); }
+  }
   if (t.id === 'f-catalog') runImport('catalog', t.files[0]);
   if (t.id === 'f-patrons') runImport('patrons', t.files[0]);
 });
@@ -645,6 +860,7 @@ document.addEventListener('submit', async (e) => {
     if (id === 'login') return passwordLogin(f);
     if (id === 'force') { setBusy(btn, true); try { await api('/auth/password', { method: 'POST', body: { current: f.current.value, next: f.next.value } }); S.me.mustChangePassword = false; toast('Password updated', 'ok'); render(); } catch (err) { authError(err.message); setBusy(btn, false); } return; }
     if (id === 'searchform') { Q.q = $('#q').value.trim(); Q.field = $('#field').value; Q.page = 1; return runSearch(); }
+    if (id === 'inventorysearch') { S.tmp.inventoryQ = new FormData(f).get('q').trim(); S.tmp.inventoryPage = 1; return loadInventory(); }
     if (id === 'patronsearch') { S.tmp.pq = $('#pq').value.trim(); return loadPatrons(); }
     if (id === 'auditsearch') { S.tmp.aq = $('#aq').value.trim(); return VIEWS.audit(); }
     if (id === 'checkout') {
@@ -697,7 +913,7 @@ addEventListener('hashchange', () => { closeModal(); render(); scrollTo(0, 0); }
     const j = await api('/auth/me');
     if (j.user) { S.me = j.user; S.csrf = j.csrf; S.cfg = { ...S.cfg, ...j.settings }; if (!location.hash) history.replaceState(null, '', '#' + home()); }
     else { S.cfg = { ...S.cfg, ...j.settings }; }
-  } catch (e) { /* offline: show sign in */ }
+  } catch (e) { if (!location.hash) history.replaceState(null, '', '#search'); }
   render();
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => navigator.serviceWorker.register('/service-worker.js').catch(() => {}));

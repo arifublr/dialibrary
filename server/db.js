@@ -288,6 +288,7 @@ async function initIndexes() {
         year INTEGER,
         language TEXT NOT NULL DEFAULT 'English',
         subjects TEXT NOT NULL DEFAULT '',
+        search_aliases TEXT NOT NULL DEFAULT '',
         call_number TEXT NOT NULL DEFAULT '',
         description TEXT NOT NULL DEFAULT '',
         created_at TIMESTAMPTZ DEFAULT NOW()
@@ -299,7 +300,10 @@ async function initIndexes() {
         biblio_id INTEGER NOT NULL REFERENCES biblio(id) ON DELETE CASCADE,
         barcode TEXT NOT NULL UNIQUE,
         location TEXT NOT NULL DEFAULT 'Main Shelves',
+        shelf_number TEXT NOT NULL DEFAULT '',
         status TEXT NOT NULL DEFAULT 'available' CHECK (status IN ('available','checked_out','on_hold','lost','withdrawn','repair')),
+        inventory_status TEXT NOT NULL DEFAULT 'unchecked',
+        inventory_checked_at TIMESTAMPTZ,
         added_at TIMESTAMPTZ DEFAULT NOW()
       );
       CREATE INDEX IF NOT EXISTS idx_items_biblio ON items(biblio_id);
@@ -329,6 +333,7 @@ async function initIndexes() {
         year INTEGER,
         language TEXT NOT NULL DEFAULT 'English',
         subjects TEXT NOT NULL DEFAULT '',
+        search_aliases TEXT NOT NULL DEFAULT '',
         call_number TEXT NOT NULL DEFAULT '',
         description TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -340,7 +345,10 @@ async function initIndexes() {
         biblio_id INTEGER NOT NULL REFERENCES biblio(id) ON DELETE CASCADE,
         barcode TEXT NOT NULL UNIQUE,
         location TEXT NOT NULL DEFAULT 'Main Shelves',
+        shelf_number TEXT NOT NULL DEFAULT '',
         status TEXT NOT NULL DEFAULT 'available' CHECK (status IN ('available','checked_out','on_hold','lost','withdrawn','repair')),
+        inventory_status TEXT NOT NULL DEFAULT 'unchecked',
+        inventory_checked_at TEXT,
         added_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
       CREATE INDEX IF NOT EXISTS idx_items_biblio ON items(biblio_id);
@@ -364,6 +372,32 @@ async function initIndexes() {
         content='biblio', content_rowid='id', tokenize='unicode61 remove_diacritics 2'
       );
     `);
+  }
+
+  if (isPg) {
+    await sql.exec(`
+      ALTER TABLE biblio ADD COLUMN IF NOT EXISTS search_aliases TEXT NOT NULL DEFAULT '';
+      ALTER TABLE items ADD COLUMN IF NOT EXISTS shelf_number TEXT NOT NULL DEFAULT '';
+      ALTER TABLE items ADD COLUMN IF NOT EXISTS inventory_status TEXT NOT NULL DEFAULT 'unchecked';
+      ALTER TABLE items ADD COLUMN IF NOT EXISTS inventory_checked_at TIMESTAMPTZ;
+      CREATE INDEX IF NOT EXISTS idx_items_inventory_status ON items(inventory_status);
+    `);
+  } else {
+    const biblioColumns = await sql.prepare('PRAGMA table_info(biblio)').all();
+    const itemColumns = await sql.prepare('PRAGMA table_info(items)').all();
+    if (!biblioColumns.some((column) => column.name === 'search_aliases')) {
+      sql.exec(`ALTER TABLE biblio ADD COLUMN search_aliases TEXT NOT NULL DEFAULT ''`);
+    }
+    if (!itemColumns.some((column) => column.name === 'inventory_status')) {
+      sql.exec(`ALTER TABLE items ADD COLUMN inventory_status TEXT NOT NULL DEFAULT 'unchecked'`);
+    }
+    if (!itemColumns.some((column) => column.name === 'shelf_number')) {
+      sql.exec(`ALTER TABLE items ADD COLUMN shelf_number TEXT NOT NULL DEFAULT ''`);
+    }
+    if (!itemColumns.some((column) => column.name === 'inventory_checked_at')) {
+      sql.exec(`ALTER TABLE items ADD COLUMN inventory_checked_at TEXT`);
+    }
+    sql.exec('CREATE INDEX IF NOT EXISTS idx_items_inventory_status ON items(inventory_status)');
   }
 }
 
