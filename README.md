@@ -57,3 +57,4 @@ Admin > Settings > Upload data. Download the template for the column names. Stud
 * This is inspired by Koha's features. It does not connect to a Koha server or import MARC records.
 * There is no email or SMS reminder yet. Overdue lists are on the librarian Loans page.
 * NeDB is an embedded database suited to a single college library. For several servers, swap `server/db.js` for MongoDB.
+"# library" 
